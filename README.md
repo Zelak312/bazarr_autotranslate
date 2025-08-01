@@ -46,6 +46,8 @@ Since Bazarr currently has **no automation features** for translation (the proce
 
 The script is configured via environment variables using a `.env` file in the same directory. Below is a list of supported variables with their descriptions and default values:
 
+[Docker compose example](#docker-compose-example)
+
 | Variable                      | Description                                                                                       | Default         |
 |-------------------------------|---------------------------------------------------------------------------------------------------|-----------------|
 | `BAZARR_BASE_URL`             | The full base URL of your Bazarr instance (e.g., `http://localhost:6767`).                       | **Required**    |
@@ -118,6 +120,24 @@ If you want the translated subtitle to be upgraded if bazarr finds subtitle in t
 `Settings -> Subtitles -> Upgrading Subtitles`
 
 ![Setting for upgrading subtitles](assets/upgrade_subs_settings.png)
+
+## Docker Compose Example
+
+```yml
+services:
+    test:
+        image: ghcr.io/zelak312/bazarr_autotranslate:latest
+        environment:
+            - BAZARR_BASE_URL=<bazarr_url>
+            - BAZARR_API_KEY=<bazarr_api_key>
+            - BASE_LANGUAGES=<languages>
+            - TO_LANGUAGES=<languages>
+            - LOG_LEVEL=info
+            # any other configuration needed
+        volumes:
+            # if logs are wanted 
+            - ./logs:/usr/src/app/logs
+```
 
 ## Contributing
 
