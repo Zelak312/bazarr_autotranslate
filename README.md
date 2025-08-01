@@ -110,16 +110,16 @@ For lingarr to do the translation, make sure to have lingarr setup correctly in 
 
 ![Lingarr translation settings in bazarr](assets/lingarr_settings.png)
 
-If setup correctly, in Bazarr's history, translations should have "Upgradable" icon
-
-![Upgradable shown in bazarr's history](assets/bazarr_upgrade.png)
-
 ## Translated Subtitle Upgrade
 
 If you want the translated subtitle to be upgraded if bazarr finds subtitle in that languages. You MUST have the upgrade setting on, see below (Those setting may change for you but `Upgrade Manually Downloaded or Translated Subtitles` must be enabled)
 `Settings -> Subtitles -> Upgrading Subtitles`
 
 ![Setting for upgrading subtitles](assets/upgrade_subs_settings.png)
+
+If setup correctly, in Bazarr's history, translations should have "Upgradable" icon
+
+![Upgradable shown in bazarr's history](assets/bazarr_upgrade.png)
 
 ## Docker Compose Example
 
