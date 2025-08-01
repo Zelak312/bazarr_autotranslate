@@ -52,8 +52,8 @@ The script is configured via environment variables using a `.env` file in the sa
 |-------------------------------|---------------------------------------------------------------------------------------------------|-----------------|
 | `BAZARR_BASE_URL`             | The full base URL of your Bazarr instance (e.g., `http://localhost:6767`).                       | **Required**    |
 | `BAZARR_API_KEY`              | Your Bazarr API key. This is required to authenticate API calls.                                 | **Required**    |
-| `BASE_LANGUAGES`              | Comma-separated list of subtitle languages to use as source for translation in code2 (e.g., `en,fr`).     | empty list (`[]`) |
-| `TO_LANGUAGES`                | Comma-separated list of subtitle languages that should be present or translated to also in code2 (e.g., `en,fr`).              | empty list (`[]`) |
+| `BASE_LANGUAGES`              | Comma-separated list of subtitle languages to use as source for translation in code2 (e.g., `en,fr`).     | required |
+| `TO_LANGUAGES`                | Comma-separated list of subtitle languages that should be present or translated to also in code2 (e.g., `en,fr`).              | required |
 | `TRANSLATION_REQUEST_TIMEOUT`| Time (in seconds) to wait for the translation to complete or consider it failed (SEE NOTE 2)                    | 900 (15 minutes) |
 | `NUM_WORKERS`                 | Number of worker threads to handle translation queue requests in parallel. That means, How many translation could be processing at the same time                      | 1               |
 | `INTERVAL_BETWEEN_SCANS`     | Interval (in seconds) between each automatic scan of your Bazarr library.                        | 300 (5 minutes) |
