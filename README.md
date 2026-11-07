@@ -10,7 +10,7 @@ A Python script that automates subtitle translation in Bazarr by leveraging its 
 > The following limits exist to mitigate this:
 >
 > - `MAX_RETRIES` (default: 3): a failing translation is skipped after this many failed attempts
-> - `MAX_TRANSLATIONS_PER_SCAN` (default: 0, unlimited): caps how many translation requests are queued per scan
+> - `MAX_TRANSLATIONS_PER_SCAN` (default: 0, unlimited): caps how many translation requests are queued per scan cycle (series and movies combined)
 > - `TRANSLATION_DELAY_SECONDS` (default: 0, disabled): minimum wait between two translation requests, a simple rate limiter
 > - `DRY_RUN` (default: `false`): log the translations that would be requested without sending anything to Bazarr
 >
@@ -65,11 +65,11 @@ The script is configured via environment variables using a `.env` file in the sa
 | `INTERVAL_BETWEEN_SCANS`      | Interval (in seconds) between each automatic scan of your Bazarr library.                                                                                                                | 300 (5 minutes)  |
 | `MIN_SUBTITLE_AGE_SECONDS`    | Minimum age (in seconds) of a source subtitle file before it may be queued for translation. Gives Bazarr time to obtain the subtitle from its providers first (SEE NOTE 5).              | 86400 (24 hours) |
 | `MAX_RETRIES`                 | How often a failing translation is retried before it is skipped for the lifetime of the process. 0 disables the limit.                                                                   | 3                |
-| `MAX_TRANSLATIONS_PER_SCAN`   | Maximum number of translation requests queued per scan. 0 disables the limit.                                                                                                            | 0 (unlimited)    |
+| `MAX_TRANSLATIONS_PER_SCAN`   | Maximum number of translation requests queued per scan cycle (series and movies combined). 0 disables the limit.                                                                         | 0 (unlimited)    |
 | `TRANSLATION_DELAY_SECONDS`   | Minimum time (in seconds) to wait between two translation requests sent to Bazarr. A simple rate limiter that protects a (paid) translation service from bursts. `0` disables the delay. | 0 (disabled)     |
 | `DRY_RUN`                     | When `true`, only log the translations that would be requested, without sending anything to Bazarr.                                                                                      | false            |
 | `LOG_LEVEL`                   | Logging level. Options: `DEBUG`, `INFO`, `WARNING`, `ERROR`.                                                                                                                             | INFO             |
-| `LOG_DIRECTORY`               | Directory where logs will be saved. Will be created if it doesn't exist.                                                                                                                 | `logs/`          |
+| `LOG_DIRECTORY`               | Directory where logs will be saved. Will be created if it doesn't exist.                                                                                                                 | logs/            |
 | `LOG_BACKUP_COUNT`            | Number of rotated log files to keep.                                                                                                                                                     | 4                |
 | `SERIES_SCAN`                 | Whether to scan TV series for missing subtitles (`true` or `false`).                                                                                                                     | true             |
 | `MOVIES_SCAN`                 | Whether to scan movies for missing subtitles (`true` or `false`).                                                                                                                        | true             |

@@ -71,6 +71,29 @@ def task_key(is_serie: bool, video_id: int, to_language: str, to_forced: bool, t
     return f"{'s' if is_serie else 'm'}_{video_id}_{to_language}_{flags}"
 
 
+class ScanBudget:
+    """
+    Per-scan-cycle budget for MAX_TRANSLATIONS_PER_SCAN.
+
+    The budget is shared between the series and the movies scan of one
+    cycle, so the limit caps the whole cycle instead of each scan
+    separately. A limit of 0 disables the cap.
+    """
+
+    def __init__(self, limit: int):
+        self.limit = limit
+        self.used = 0
+
+    def remaining(self) -> Optional[int]:
+        """Remaining capacity, or None when the cap is disabled."""
+        if self.limit <= 0:
+            return None
+        return max(self.limit - self.used, 0)
+
+    def consume(self, count: int) -> None:
+        self.used += count
+
+
 # Get configuration and setup things
 load_dotenv()
 
@@ -300,6 +323,7 @@ async def find_base_language_subtitles_from_missing_subtitles(
     base_url: str,
     api_key: str,
     videos: List[Serie] | List[Movie],
+    budget: Optional[ScanBudget] = None,
 ) -> Optional[List[SubtitleTranslate]]:
     # Making a video id to missing-subtitles map, useful later on.
     # The full MissingSubtitle entry is kept instead of only its code2:
@@ -393,12 +417,14 @@ async def find_base_language_subtitles_from_missing_subtitles(
         logger.info("No already existing subtitles matched with requested translation subs")
         return None
 
-    if max_translations_per_scan > 0 and len(subtitles_to_translate) > max_translations_per_scan:
+    remaining = budget.remaining() if budget is not None else None
+    if remaining is not None and len(subtitles_to_translate) > remaining:
         logger.warning(
             f"Found {len(subtitles_to_translate)} matching subtitles, "
-            f"capping this scan at MAX_TRANSLATIONS_PER_SCAN={max_translations_per_scan}"
+            f"capping this scan cycle at MAX_TRANSLATIONS_PER_SCAN={max_translations_per_scan} "
+            f"({remaining} remaining)"
         )
-        subtitles_to_translate = subtitles_to_translate[:max_translations_per_scan]
+        subtitles_to_translate = subtitles_to_translate[:remaining]
 
     logger.debug(f"Matching subtitles: {[w.to_dict() for w in subtitles_to_translate]}")
     logger.info(f"Found {len(subtitles_to_translate)} matching subtitles to translate")
@@ -410,11 +436,14 @@ def queue_subtitles_for_translation(subtitles: List[SubtitleTranslate]) -> int:
     for sub in subtitles:
         key = task_key(sub.is_serie, sub.video_id, sub.to_language, sub.to_forced, sub.to_hi)
         # Skip items that have exceeded the retry limit, so a permanently
-        # failing subtitle cannot hammer a (paid) translation service forever
-        if max_retries > 0 and failure_counts.get(key, 0) >= max_retries:
+        # failing subtitle cannot hammer a (paid) translation service forever.
+        # The counter is read under the lock because worker threads update it.
+        with failure_lock:
+            failures = failure_counts.get(key, 0)
+        if max_retries > 0 and failures >= max_retries:
             logger.warning(
                 f"Skipping translation of {sub.base_subtitle.path} to {sub.to_language}: "
-                f"it already failed {failure_counts[key]} times (MAX_RETRIES={max_retries}). "
+                f"it already failed {failures} times (MAX_RETRIES={max_retries}). "
                 f"Restart the process to retry it again."
             )
             continue
@@ -480,7 +509,7 @@ def translation_worker(worker_id, base_url, api_key):
                     shutdown_thread_event.wait(translation_delay)
 
 
-async def scan_and_process_series(client, base_url, api_key):
+async def scan_and_process_series(client, base_url, api_key, budget: Optional[ScanBudget] = None):
     logger.info("Scanning for episodes")
     series = await get_wanted_episodes(client, base_url, api_key)
     if series is None or len(series) == 0:
@@ -488,14 +517,18 @@ async def scan_and_process_series(client, base_url, api_key):
         return
 
     logger.info(f"Found {len(series)} missing subtitles for episodes")
-    subtitles_to_translate = await find_base_language_subtitles_from_missing_subtitles(client, base_url, api_key, series)
+    subtitles_to_translate = await find_base_language_subtitles_from_missing_subtitles(
+        client, base_url, api_key, series, budget
+    )
     if subtitles_to_translate is None:
         return
 
-    queue_subtitles_for_translation(subtitles_to_translate)
+    queued = queue_subtitles_for_translation(subtitles_to_translate)
+    if budget is not None:
+        budget.consume(queued)
 
 
-async def scan_and_process_movies(client, base_url, api_key):
+async def scan_and_process_movies(client, base_url, api_key, budget: Optional[ScanBudget] = None):
     logger.info("Scanning for movies")
     movies = await get_wanted_movies(client, base_url, api_key)
     if movies is None or len(movies) == 0:
@@ -503,11 +536,15 @@ async def scan_and_process_movies(client, base_url, api_key):
         return
 
     logger.info(f"Found {len(movies)} missing subtitles for movies")
-    subtitles_to_translate = await find_base_language_subtitles_from_missing_subtitles(client, base_url, api_key, movies)
+    subtitles_to_translate = await find_base_language_subtitles_from_missing_subtitles(
+        client, base_url, api_key, movies, budget
+    )
     if subtitles_to_translate is None:
         return
 
-    queue_subtitles_for_translation(subtitles_to_translate)
+    queued = queue_subtitles_for_translation(subtitles_to_translate)
+    if budget is not None:
+        budget.consume(queued)
 
 
 async def main(base_url, api_key):
@@ -520,11 +557,14 @@ async def main(base_url, api_key):
     # One shared client for all API calls instead of a new client per request
     async with httpx.AsyncClient(timeout=30) as client:
         while not shutdown_event.is_set():
+            # A fresh budget per cycle, shared by the series and the movies
+            # scan so MAX_TRANSLATIONS_PER_SCAN caps the whole cycle
+            budget = ScanBudget(max_translations_per_scan)
             try:
                 if series_scan:
-                    await scan_and_process_series(client, base_url, api_key)
+                    await scan_and_process_series(client, base_url, api_key, budget)
                 if movies_scan:
-                    await scan_and_process_movies(client, base_url, api_key)
+                    await scan_and_process_movies(client, base_url, api_key, budget)
             except Exception:
                 logger.exception("Uncaught exception during scan")
 
@@ -590,6 +630,30 @@ if __name__ == "__main__":
 
     if num_workers < 1:
         print("NUM_WORKERS must be at least 1")
+        sys.exit(1)
+
+    if interval_between_scans < 1:
+        print("INTERVAL_BETWEEN_SCANS must be at least 1 second")
+        sys.exit(1)
+
+    if min_subtitle_age < 0:
+        print("MIN_SUBTITLE_AGE_SECONDS must be 0 or greater")
+        sys.exit(1)
+
+    if max_retries < 0:
+        print("MAX_RETRIES must be 0 or greater (0 disables the limit)")
+        sys.exit(1)
+
+    if max_translations_per_scan < 0:
+        print("MAX_TRANSLATIONS_PER_SCAN must be 0 or greater (0 disables the cap)")
+        sys.exit(1)
+
+    if translation_delay < 0:
+        print("TRANSLATION_DELAY_SECONDS must be 0 or greater")
+        sys.exit(1)
+
+    if translation_request_timeout < 1:
+        print("TRANSLATION_REQUEST_TIMEOUT must be at least 1 second")
         sys.exit(1)
 
     # Setup logger
