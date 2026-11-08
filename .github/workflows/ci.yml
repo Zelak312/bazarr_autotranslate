@@ -23,7 +23,7 @@ jobs:
                   pip install -r requirements-dev.txt
 
             - name: Lint
-              run: ruff check .
+              run: ruff check --output-format=github .
 
             - name: Test
               run: pytest -q
