@@ -159,6 +159,10 @@ failure_lock = threading.Lock()
 # time.monotonic() so the entries stay valid across wall-clock changes.
 recent_completions: dict[str, float] = {}
 completion_lock = threading.Lock()
+# Start time of the most recent translation request sent to Bazarr, used
+# to enforce TRANSLATION_DELAY_SECONDS globally across all worker threads.
+last_request_time = 0.0
+rate_limit_lock = threading.Lock()
 logger = logging.getLogger("bazarr_lingarr")
 
 
@@ -522,6 +526,28 @@ def queue_subtitles_for_translation(subtitles: List[SubtitleTranslate]) -> int:
     return queued
 
 
+def rate_limit_wait() -> bool:
+    """
+    Enforce TRANSLATION_DELAY_SECONDS globally: before a worker sends a
+    translation request, wait until the configured delay has passed since
+    the previous request of ANY worker, so the requests of multiple
+    workers are spaced as well. Returns True when a shutdown was
+    requested during the wait, in which case the caller must not send.
+    Waiting on the shutdown thread event keeps a shutdown signal
+    effective during the delay.
+    """
+    global last_request_time
+    if translation_delay <= 0:
+        return False
+    with rate_limit_lock:
+        wait_for = translation_delay - (time.monotonic() - last_request_time)
+        if wait_for > 0:
+            if shutdown_thread_event.wait(wait_for):
+                return True
+        last_request_time = time.monotonic()
+    return False
+
+
 def translation_worker(worker_id, base_url, api_key):
     endpoint = f"{base_url}/api/subtitles"
     headers = {"X-API-KEY": api_key}
@@ -534,6 +560,12 @@ def translation_worker(worker_id, base_url, api_key):
                 return
             key = task_key(sub.is_serie, sub.video_id, sub.to_language, sub.to_forced, sub.to_hi)
             logger.info(f"[Worker: {worker_id}] Translating: {sub.base_subtitle.path} to: {sub.to_language}")
+            if rate_limit_wait():
+                # A shutdown was requested during the rate-limit wait:
+                # release the task without sending it, so a future run
+                # queues it again
+                task_queue.done(sub)
+                continue
             try:
                 params = {
                     "action": "translate",
@@ -568,11 +600,6 @@ def translation_worker(worker_id, base_url, api_key):
                     failure_counts[key] = failure_counts.get(key, 0) + 1
             finally:
                 task_queue.done(sub)
-                if translation_delay > 0:
-                    # Rate limiting: space out requests to the translation
-                    # service. Waiting on the shutdown event lets a shutdown
-                    # signal interrupt the delay immediately.
-                    shutdown_thread_event.wait(translation_delay)
 
 
 async def _scan_wanted(client, base_url, api_key, label, wanted_fetch, budget: Optional[ScanBudget] = None):
