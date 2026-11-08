@@ -19,6 +19,12 @@ jobs:
         steps:
             - name: Checkout
               uses: actions/checkout@v4
+              with:
+                  # The latest-tag detection compares the dispatched tag
+                  # against the full tag list, which needs the tags on
+                  # disk: the default shallow checkout fetches a single
+                  # commit and no tags at all
+                  fetch-depth: 0
 
             - name: Set up QEMU
               uses: docker/setup-qemu-action@v3
@@ -34,12 +40,9 @@ jobs:
                   password: ${{ secrets.GITHUB_TOKEN }}
 
             - name: Determine Tag Name
-              run: |
-                  if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-                    echo "tag=${{ github.event.inputs.tag }}" >> $GITHUB_ENV
-                  else
-                    echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
-                  fi
+              # Only workflow_dispatch can trigger this workflow, so the tag
+              # always comes from the dispatch input
+              run: echo "tag=${{ github.event.inputs.tag }}" >> $GITHUB_ENV
 
             - name: Determine if latest tag
               run: |
