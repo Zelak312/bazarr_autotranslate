@@ -48,10 +48,7 @@ def _run_find_base(videos, metadata_response, budget=None):
 def test_matching_prefers_source_with_matching_flags(tmp_path, monkeypatch):
     _setup(monkeypatch)
     source = tmp_path / "episode.en.srt"
-    source.write_text("1
-00:00:01,000 --> 00:00:02,000
-hello
-", encoding="utf-8")
+    source.write_text("1\n00:00:01,000 --> 00:00:02,000\nhello\n", encoding="utf-8")
 
     # The forced Dutch variant is missing; both a forced and a regular
     # English source exist, so the forced one must be preferred
