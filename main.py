@@ -824,8 +824,10 @@ if __name__ == "__main__":
         case "error":
             logger.setLevel(logging.ERROR)
         case _:
-            print(f"Unknown LOG_LEVEL: {log_level!r}, falling back to INFO")
-            logger.setLevel(logging.INFO)
+            # Fail fast on a typo in LOG_LEVEL: silently falling back to
+            # INFO would hide a requested DEBUG (or ERROR) configuration
+            print(f"Unknown LOG_LEVEL: {log_level!r}, expected DEBUG, INFO, WARNING or ERROR")
+            sys.exit(1)
 
     # Start running things
     loop = asyncio.new_event_loop()
