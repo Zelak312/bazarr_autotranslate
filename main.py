@@ -51,6 +51,15 @@ def parse_int(env_name: str, default: int) -> int:
         sys.exit(1)
 
 
+def normalize_base_url(url: str) -> str:
+    """
+    Strip trailing slashes from the base URL: a value like
+    "http://host:6767/" would otherwise produce "//api/..." in every
+    endpoint URL, which Bazarr rejects.
+    """
+    return url.rstrip("/")
+
+
 def task_key(is_serie: bool, video_id: int, to_language: str, to_forced: bool, to_hi: bool) -> str:
     """
     Unique key for one video-to-language translation request.
@@ -684,6 +693,10 @@ if __name__ == "__main__":
     if api_key is None:
         print("BAZARR_API_KEY is missing")
         sys.exit(1)
+
+    # Normalize early: a trailing slash would otherwise produce "//api/..."
+    # in every endpoint URL built from this value
+    base_url = normalize_base_url(base_url)
 
     if len(base_languages) == 0:
         print("Missing BASE_LANGUAGES")
