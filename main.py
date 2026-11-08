@@ -6,7 +6,8 @@ import signal
 import asyncio
 import logging
 import threading
-from typing import List, Optional
+from dataclasses import asdict
+from typing import Callable, List, Optional
 from dotenv import load_dotenv
 from unique_queue import UniqueQueue
 from class_types import Serie, Movie, SubtitleTranslate, MissingSubtitle
@@ -18,16 +19,7 @@ def get_env_or_default(env, default):
     return val if val is not None else default
 
 
-def get_attr_or_key(obj, name):
-    if hasattr(obj, name):
-        return getattr(obj, name)
-    elif isinstance(obj, dict) and name in obj:
-        return obj[name]
-    else:
-        raise AttributeError(f"Missing attribute or key '{name}'")
-
-
-def parse_bool(value, env_name, default):
+def parse_bool(env_name: str, default: bool) -> bool:
     """
     Parse a boolean environment variable.
 
@@ -35,9 +27,10 @@ def parse_bool(value, env_name, default):
     environment variables: any non-empty string is truthy, which silently
     made SERIES_SCAN=false and MOVIES_SCAN=false impossible to set.
     """
+    value = os.getenv(env_name)
     if value is None:
         return default
-    normalized = str(value).strip().lower()
+    normalized = value.strip().lower()
     if normalized in ("true", "1", "yes", "on"):
         return True
     if normalized in ("false", "0", "no", "off"):
@@ -46,7 +39,7 @@ def parse_bool(value, env_name, default):
     sys.exit(1)
 
 
-def parse_int(env_name, default):
+def parse_int(env_name: str, default: int) -> int:
     """Parse an integer environment variable with a clear error message."""
     val = os.getenv(env_name)
     if val is None:
@@ -69,6 +62,11 @@ def task_key(is_serie: bool, video_id: int, to_language: str, to_forced: bool, t
     """
     flags = f"{'f' if to_forced else '-'}{'h' if to_hi else '-'}"
     return f"{'s' if is_serie else 'm'}_{video_id}_{to_language}_{flags}"
+
+
+def key_fn(task: SubtitleTranslate) -> str:
+    """Queue key for a translation task."""
+    return task_key(task.is_serie, task.video_id, task.to_language, task.to_forced, task.to_hi)
 
 
 class ScanBudget:
@@ -121,21 +119,21 @@ max_translations_per_scan = parse_int("MAX_TRANSLATIONS_PER_SCAN", 0)
 # that protects a (paid) translation service from bursts when a scan
 # discovers a large backlog in one go.
 translation_delay = parse_int("TRANSLATION_DELAY_SECONDS", 0)
+# Suppress re-queueing a translation for this many seconds after it
+# completed, so a scan cannot queue a duplicate while Bazarr is still
+# re-indexing the newly written subtitle. 0 disables the cooldown.
+requeue_cooldown = parse_int("REQUEUE_COOLDOWN_SECONDS", 300)
 # When true, the script only logs which translations it would request and
 # never sends anything to Bazarr. Useful to validate a new configuration
 # (language lists, path mapping, age gate) before real translations start.
-dry_run = parse_bool(os.getenv("DRY_RUN"), "DRY_RUN", False)
+dry_run = parse_bool("DRY_RUN", False)
 
 log_level = get_env_or_default("LOG_LEVEL", "INFO")
 log_directory = get_env_or_default("LOG_DIRECTORY", "logs/")
 # How many rotated log files to keep.
 log_backup_count = parse_int("LOG_BACKUP_COUNT", 4)
-series_scan = parse_bool(os.getenv("SERIES_SCAN"), "SERIES_SCAN", True)
-movies_scan = parse_bool(os.getenv("MOVIES_SCAN"), "MOVIES_SCAN", True)
-
-key_fn = lambda x: task_key(get_attr_or_key(x, "is_serie"), get_attr_or_key(x, "video_id"),
-                            get_attr_or_key(x, "to_language"), get_attr_or_key(x, "to_forced"),
-                            get_attr_or_key(x, "to_hi"))
+series_scan = parse_bool("SERIES_SCAN", True)
+movies_scan = parse_bool("MOVIES_SCAN", True)
 
 task_queue = UniqueQueue(key_fn=key_fn)
 shutdown_event = asyncio.Event()
@@ -147,10 +145,15 @@ shutdown_thread_event = threading.Event()
 # Failed translation attempts per task key, used to enforce MAX_RETRIES
 failure_counts: dict[str, int] = {}
 failure_lock = threading.Lock()
+# Translation task keys with the time they completed, used with
+# REQUEUE_COOLDOWN_SECONDS to suppress re-queueing duplicates. Keyed by
+# time.monotonic() so the entries stay valid across wall-clock changes.
+recent_completions: dict[str, float] = {}
+completion_lock = threading.Lock()
 logger = logging.getLogger("bazarr_lingarr")
 
 
-def is_subtitle_old_enough(path: str) -> bool:
+def is_subtitle_old_enough(path: str, age_cache: dict[str, bool]) -> bool:
     """
     Return True only if the subtitle file at `path` is at least
     `min_subtitle_age` seconds old, based on its modification time.
@@ -162,18 +165,56 @@ def is_subtitle_old_enough(path: str) -> bool:
     If the file cannot be inspected (not mounted, permission issue),
     the subtitle is skipped and a warning is logged, so that a path
     mapping problem never silently disables the age gate.
+
+    Results are cached in `age_cache` so a source file that is checked
+    for several missing languages is only inspected (and warned about)
+    once per scan.
     """
+    cached = age_cache.get(path)
+    if cached is not None:
+        return cached
+
     try:
         age = time.time() - os.path.getmtime(path)
     except OSError:
         logger.warning(f"Skipping translation, unable to determine age of subtitle file: {path}. "
                        f"Verify that the media path is mounted in this container at the same path Bazarr reports.")
+        age_cache[path] = False
         return False
-    if age < min_subtitle_age:
+
+    old_enough = age >= min_subtitle_age
+    if not old_enough:
         logger.debug(f"Skipping translation, subtitle is only {int(age // 3600)} hours old "
                      f"(minimum age: {int(min_subtitle_age // 3600)} hours): {path}")
-        return False
-    return True
+
+    age_cache[path] = old_enough
+    return old_enough
+
+
+async def api_get_parsed(
+    client: httpx.AsyncClient,
+    endpoint: str,
+    api_key: str,
+    parse: Callable,
+    params: Optional[dict] = None,
+    error_context: str = "",
+):
+    """
+    GET an API endpoint and parse its "data" payload with the given parse
+    function. Returns None on any error, so callers can distinguish a
+    failed request (None) from a genuinely empty result ([]).
+    """
+    headers = {"X-API-KEY": api_key}
+    try:
+        response = await client.get(endpoint, headers=headers, params=params)
+        response.raise_for_status()
+        payload = response.json()["data"]
+
+        logger.debug(f"received: {payload}")
+        return parse(payload)
+    except Exception:
+        logger.exception(f"Error while {error_context}")
+        return None
 
 
 async def get_episodes_metadata(
@@ -194,25 +235,19 @@ async def get_episodes_metadata(
         episode_ids (list[int], optional): List of episode IDs to get metadata for
     """
     logger.debug(f"Getting metadata for series: {series_ids}, episodes: {episode_ids}")
-    endpoint = f"{base_url}/api/episodes"
-    headers = {"X-API-KEY": api_key}
-
     params = {}
     if series_ids:
         params["seriesid[]"] = series_ids
     if episode_ids:
         params["episodeid[]"] = episode_ids
-
-    try:
-        response = await client.get(endpoint, headers=headers, params=params)
-        response.raise_for_status()
-        json = response.json()["data"]
-
-        logger.debug(f"received: {json}")
-        return [Serie.from_dict(obj) for obj in json]
-    except Exception:
-        logger.exception(f"Error while getting episode metadata for series: {series_ids}, episodes: {episode_ids}")
-        return None
+    return await api_get_parsed(
+        client,
+        f"{base_url}/api/episodes",
+        api_key,
+        parse=lambda data: [Serie.from_dict(obj) for obj in data],
+        params=params,
+        error_context=f"getting episode metadata for series: {series_ids}, episodes: {episode_ids}",
+    )
 
 
 async def get_wanted_episodes(
@@ -233,20 +268,14 @@ async def get_wanted_episodes(
         length (int): Paging length (default: -1)
     """
     logger.debug("Getting wanted episodes")
-    endpoint = f"{base_url}/api/episodes/wanted"
-    headers = {"X-API-KEY": api_key}
-    params = {"start": start, "length": length}
-
-    try:
-        response = await client.get(endpoint, headers=headers, params=params)
-        response.raise_for_status()
-        json = response.json()["data"]
-
-        logger.debug(f"received: {json}")
-        return [Serie.from_dict(obj) for obj in json]
-    except Exception:
-        logger.exception("Error while getting wanted episodes")
-        return None
+    return await api_get_parsed(
+        client,
+        f"{base_url}/api/episodes/wanted",
+        api_key,
+        parse=lambda data: [Serie.from_dict(obj) for obj in data],
+        params={"start": start, "length": length},
+        error_context="getting wanted episodes",
+    )
 
 
 async def get_movies_metadata(
@@ -265,23 +294,17 @@ async def get_movies_metadata(
         movie_ids (list[int], optional): List of movie IDs to get metadata for
     """
     logger.debug(f"Getting metadata for movies: {movie_ids}")
-    endpoint = f"{base_url}/api/movies"
-    headers = {"X-API-KEY": api_key}
     params = {}
-
     if movie_ids:
         params["radarrid[]"] = movie_ids
-
-    try:
-        response = await client.get(endpoint, headers=headers, params=params)
-        response.raise_for_status()
-        json = response.json()["data"]
-
-        logger.debug(f"received: {json}")
-        return [Movie.from_dict(obj) for obj in json]
-    except Exception:
-        logger.exception(f"Error while getting movie metadata for movies: {movie_ids}")
-        return None
+    return await api_get_parsed(
+        client,
+        f"{base_url}/api/movies",
+        api_key,
+        parse=lambda data: [Movie.from_dict(obj) for obj in data],
+        params=params,
+        error_context=f"getting movie metadata for movies: {movie_ids}",
+    )
 
 
 async def get_wanted_movies(
@@ -302,20 +325,30 @@ async def get_wanted_movies(
         length (int): Paging length (default: -1)
     """
     logger.debug("Getting wanted movies")
-    endpoint = f"{base_url}/api/movies/wanted"
-    headers = {"X-API-KEY": api_key}
-    params = {"start": start, "length": length}
+    return await api_get_parsed(
+        client,
+        f"{base_url}/api/movies/wanted",
+        api_key,
+        parse=lambda data: [Movie.from_dict(obj) for obj in data],
+        params={"start": start, "length": length},
+        error_context="getting wanted movies",
+    )
 
+
+async def verify_bazarr_connection(client: httpx.AsyncClient, base_url: str, api_key: str) -> None:
+    """
+    Verify Bazarr is reachable and the API key is valid, exiting with a
+    clear message otherwise. Failing fast here turns a wrong URL or a
+    wrong key into an immediate, actionable error instead of repeated
+    scan failures; a 401 response means the key is wrong.
+    """
     try:
-        response = await client.get(endpoint, headers=headers, params=params)
+        response = await client.get(f"{base_url}/api/system/status", headers={"X-API-KEY": api_key})
         response.raise_for_status()
-        json = response.json()["data"]
-
-        logger.debug(f"received: {json}")
-        return [Movie.from_dict(obj) for obj in json]
-    except Exception:
-        logger.exception("Error while getting wanted movies")
-        return None
+    except Exception as e:
+        print(f"Could not connect to Bazarr at {base_url}, or the API key is invalid: {e}")
+        sys.exit(1)
+    logger.info("Successfully connected to Bazarr")
 
 
 async def find_base_language_subtitles_from_missing_subtitles(
@@ -338,10 +371,9 @@ async def find_base_language_subtitles_from_missing_subtitles(
             # Check if the missing subtitle is in the list of languages to translate to
             if missing_sub.code2 in to_languages:
                 # Check if that subtitle is already in the translation queue
-                if task_queue.check({"is_serie": isinstance(video, Serie), "video_id": video_id,
-                                     "to_language": missing_sub.code2, "to_forced": missing_sub.forced,
-                                     "to_hi": missing_sub.hi}):
-                    logger.debug(f"Skipping subtitle, already in translation queue, {missing_sub.to_dict()}")
+                if task_queue.check_key(task_key(isinstance(video, Serie), video_id,
+                                                 missing_sub.code2, missing_sub.forced, missing_sub.hi)):
+                    logger.debug(f"Skipping subtitle, already in translation queue, {asdict(missing_sub)}")
                     continue
 
                 video_id_missing_map.setdefault(video_id, []).append(missing_sub)
@@ -358,13 +390,21 @@ async def find_base_language_subtitles_from_missing_subtitles(
         metadata = await get_movies_metadata(client, base_url, api_key, movie_ids=list(video_id_missing_map.keys()))
 
     if metadata is None:
-        logger.info("No metadata returned, couldn't find already existing subtitles")
+        logger.error("Failed to retrieve metadata, couldn't find already existing subtitles")
+        return None
+
+    if len(metadata) == 0:
+        logger.warning("No metadata was returned for the videos with missing subtitles")
         return None
 
     video_id_to_video_map: dict[int, Serie | Movie] = {}
     for video in metadata:
         video_id = video.sonarr_episode_id if isinstance(video, Serie) else video.radarr_id
         video_id_to_video_map[video_id] = video
+
+    # Age-gate results are cached per scan so each source file is only
+    # inspected (and warned about) once.
+    age_cache: dict[str, bool] = {}
 
     # Check the metadata for already existing subtitles
     # Match the existing subtitles from the base language list to the missing ones for translation
@@ -390,7 +430,7 @@ async def find_base_language_subtitles_from_missing_subtitles(
                           if sub.code2 in base_languages
                           and sub.code2 != missing.code2
                           and sub.path
-                          and is_subtitle_old_enough(sub.path)]
+                          and is_subtitle_old_enough(sub.path, age_cache)]
 
             if not candidates:
                 logger.debug(f"No matching existing subtitle found for: {missing.code2} "
@@ -417,6 +457,8 @@ async def find_base_language_subtitles_from_missing_subtitles(
         logger.info("No already existing subtitles matched with requested translation subs")
         return None
 
+    # The cap applies per scan cycle, to protect a (paid) translation
+    # service from large bursts queued in one go.
     remaining = budget.remaining() if budget is not None else None
     if remaining is not None and len(subtitles_to_translate) > remaining:
         logger.warning(
@@ -426,7 +468,7 @@ async def find_base_language_subtitles_from_missing_subtitles(
         )
         subtitles_to_translate = subtitles_to_translate[:remaining]
 
-    logger.debug(f"Matching subtitles: {[w.to_dict() for w in subtitles_to_translate]}")
+    logger.debug(f"Matching subtitles: {[asdict(w) for w in subtitles_to_translate]}")
     logger.info(f"Found {len(subtitles_to_translate)} matching subtitles to translate")
     return subtitles_to_translate
 
@@ -447,6 +489,17 @@ def queue_subtitles_for_translation(subtitles: List[SubtitleTranslate]) -> int:
                 f"Restart the process to retry it again."
             )
             continue
+        # Suppress re-queueing a translation for a short time after it
+        # completed: Bazarr has not re-indexed the newly written subtitle
+        # yet, so it would still appear missing and be queued twice.
+        if requeue_cooldown > 0:
+            with completion_lock:
+                last_completed = recent_completions.get(key)
+            if last_completed is not None and time.monotonic() - last_completed < requeue_cooldown:
+                logger.debug(f"Skipping {sub.base_subtitle.path} to {sub.to_language}, "
+                             f"it was translated less than {requeue_cooldown} seconds ago and Bazarr may not "
+                             f"have re-indexed the new subtitle yet")
+                continue
         variant = f"{'.forced' if sub.to_forced else ''}{'.hi' if sub.to_hi else ''}"
         if dry_run:
             # DRY_RUN: log the request without queueing it, so a new setup
@@ -496,6 +549,10 @@ def translation_worker(worker_id, base_url, api_key):
                 # is not blocked by an old failure
                 with failure_lock:
                     failure_counts.pop(key, None)
+                # Record the completion so the scan does not queue a
+                # duplicate while Bazarr is still re-indexing the new subtitle
+                with completion_lock:
+                    recent_completions[key] = time.monotonic()
             except Exception:
                 logger.exception(f"[Worker: {worker_id}] Error while translating: {sub.base_subtitle.path} to: {sub.to_language}")
                 with failure_lock:
@@ -509,16 +566,28 @@ def translation_worker(worker_id, base_url, api_key):
                     shutdown_thread_event.wait(translation_delay)
 
 
-async def scan_and_process_series(client, base_url, api_key, budget: Optional[ScanBudget] = None):
-    logger.info("Scanning for episodes")
-    series = await get_wanted_episodes(client, base_url, api_key)
-    if series is None or len(series) == 0:
-        logger.info("Found no missing subtitles for episodes")
+async def _scan_wanted(client, base_url, api_key, label, wanted_fetch, budget: Optional[ScanBudget] = None):
+    """
+    Shared scan logic for episodes and movies.
+
+    Args:
+        label (str): "episodes" or "movies", used in the log messages
+        wanted_fetch: coroutine that lists the wanted videos
+        budget (ScanBudget, optional): per-cycle translation cap, shared
+            with the other scan
+    """
+    logger.info(f"Scanning for {label}")
+    videos = await wanted_fetch
+    if videos is None:
+        logger.error(f"Failed to retrieve wanted {label}, skipping this scan")
+        return
+    if len(videos) == 0:
+        logger.info(f"Found no missing subtitles for {label}")
         return
 
-    logger.info(f"Found {len(series)} missing subtitles for episodes")
+    logger.info(f"Found {len(videos)} missing subtitles for {label}")
     subtitles_to_translate = await find_base_language_subtitles_from_missing_subtitles(
-        client, base_url, api_key, series, budget
+        client, base_url, api_key, videos, budget
     )
     if subtitles_to_translate is None:
         return
@@ -526,25 +595,29 @@ async def scan_and_process_series(client, base_url, api_key, budget: Optional[Sc
     queued = queue_subtitles_for_translation(subtitles_to_translate)
     if budget is not None:
         budget.consume(queued)
+
+
+async def scan_and_process_series(client, base_url, api_key, budget: Optional[ScanBudget] = None):
+    """Scan wanted episodes and queue translations for them."""
+    await _scan_wanted(client, base_url, api_key, "episodes",
+                       get_wanted_episodes(client, base_url, api_key), budget)
 
 
 async def scan_and_process_movies(client, base_url, api_key, budget: Optional[ScanBudget] = None):
-    logger.info("Scanning for movies")
-    movies = await get_wanted_movies(client, base_url, api_key)
-    if movies is None or len(movies) == 0:
-        logger.info("Found no missing subtitles for movies")
-        return
+    """Scan wanted movies and queue translations for them."""
+    await _scan_wanted(client, base_url, api_key, "movies",
+                       get_wanted_movies(client, base_url, api_key), budget)
 
-    logger.info(f"Found {len(movies)} missing subtitles for movies")
-    subtitles_to_translate = await find_base_language_subtitles_from_missing_subtitles(
-        client, base_url, api_key, movies, budget
-    )
-    if subtitles_to_translate is None:
-        return
 
-    queued = queue_subtitles_for_translation(subtitles_to_translate)
-    if budget is not None:
-        budget.consume(queued)
+def prune_recent_completions() -> None:
+    """Remove expired entries from recent_completions so it cannot grow unbounded."""
+    if requeue_cooldown <= 0:
+        return
+    cutoff = time.monotonic() - requeue_cooldown
+    with completion_lock:
+        expired = [key for key, completed_at in recent_completions.items() if completed_at <= cutoff]
+        for key in expired:
+            del recent_completions[key]
 
 
 async def main(base_url, api_key):
@@ -556,7 +629,13 @@ async def main(base_url, api_key):
 
     # One shared client for all API calls instead of a new client per request
     async with httpx.AsyncClient(timeout=30) as client:
+        # Fail fast: verify Bazarr is reachable and the API key is valid
+        # before entering the scan loop, so a wrong URL or key is reported
+        # immediately instead of as repeated scan failures
+        await verify_bazarr_connection(client, base_url, api_key)
+
         while not shutdown_event.is_set():
+            prune_recent_completions()
             # A fresh budget per cycle, shared by the series and the movies
             # scan so MAX_TRANSLATIONS_PER_SCAN caps the whole cycle
             budget = ScanBudget(max_translations_per_scan)
@@ -656,6 +735,10 @@ if __name__ == "__main__":
         print("TRANSLATION_REQUEST_TIMEOUT must be at least 1 second")
         sys.exit(1)
 
+    if requeue_cooldown < 0:
+        print("REQUEUE_COOLDOWN_SECONDS must be 0 or greater (0 disables the cooldown)")
+        sys.exit(1)
+
     # Setup logger
     logger.propagate = False
     trailing_slash = "/" if not log_directory.endswith("/") else ""
@@ -686,6 +769,7 @@ if __name__ == "__main__":
             logger.debug(f"max_retries: {max_retries}")
             logger.debug(f"max_translations_per_scan: {max_translations_per_scan}")
             logger.debug(f"translation_delay: {translation_delay}")
+            logger.debug(f"requeue_cooldown: {requeue_cooldown}")
             logger.debug(f"dry_run: {dry_run}")
             logger.debug(f"log_level: {log_level}")
             logger.debug(f"log_directory: {log_directory}")
@@ -705,7 +789,10 @@ if __name__ == "__main__":
 
     # Start running things
     loop = asyncio.new_event_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, handle_shutdown)
+    try:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, handle_shutdown)
 
-    loop.run_until_complete(main(base_url, api_key))
+        loop.run_until_complete(main(base_url, api_key))
+    finally:
+        loop.close()

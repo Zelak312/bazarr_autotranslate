@@ -48,7 +48,10 @@ class UniqueQueue:
             # block that video/language from ever being queued again.
             self.seen.discard(key)
 
-    def check(self, item):
-        key = self.key_fn(item)
+    def check_key(self, key):
+        """
+        Return True when a task with this key is queued or currently being
+        processed (i.e. not yet released via done()).
+        """
         with self.lock:
             return key in self.seen
