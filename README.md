@@ -66,7 +66,7 @@ The script is configured via environment variables using a `.env` file in the sa
 | `MIN_SUBTITLE_AGE_SECONDS`    | Minimum age (in seconds) of a source subtitle file before it may be queued for translation. Gives Bazarr time to obtain the subtitle from its providers first (SEE NOTE 5).              | 86400 (24 hours) |
 | `MAX_RETRIES`                 | How often a failing translation is retried before it is skipped for the lifetime of the process. 0 disables the limit.                                                                   | 3                |
 | `MAX_TRANSLATIONS_PER_SCAN`   | Maximum number of translation requests queued per scan cycle (series and movies combined). 0 disables the limit.                                                                         | 0 (unlimited)    |
-| `TRANSLATION_DELAY_SECONDS`   | Minimum time (in seconds) to wait between two translation requests sent to Bazarr. A simple rate limiter that protects a (paid) translation service from bursts. `0` disables the delay. | 0 (disabled)     |
+| `TRANSLATION_DELAY_SECONDS`   | Minimum time (in seconds) to wait between two translation requests sent to Bazarr, enforced across all workers. A simple rate limiter that protects a (paid) translation service from bursts. `0` disables the delay. | 0 (disabled)     |
 | `REQUEUE_COOLDOWN_SECONDS`    | Minimum time (in seconds) before a translation may be queued again after it completed, to avoid duplicate requests while Bazarr re-indexes the new subtitle. `0` disables the cooldown. | 300              |
 | `DRY_RUN`                     | When `true`, only log the translations that would be requested, without sending anything to Bazarr.                                                                                      | false            |
 | `LOG_LEVEL`                   | Logging level. Options: `DEBUG`, `INFO`, `WARNING`, `ERROR`.                                                                                                                             | INFO             |
@@ -148,6 +148,9 @@ If set up correctly, in Bazarr's history, translations should have the "Upgradab
 services:
     bazarr-autotranslate:
         image: ghcr.io/panic3564/bazarr_autotranslate:latest
+        # Restart the container after a reboot or a crash; without a
+        # restart policy the automation silently stops until manual action
+        restart: unless-stopped
         environment:
             - BAZARR_BASE_URL=<bazarr_url>
             - BAZARR_API_KEY=<bazarr_api_key>

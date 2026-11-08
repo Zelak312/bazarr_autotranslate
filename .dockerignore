@@ -1,4 +1,14 @@
-__pycache__
+.git
+.github
 .devcontainer
+assets
+tests
+Dockerfile
+.dockerignore
+.gitignore
+__pycache__
 .env
 logs
+README.md
+pyproject.toml
+requirements-dev.txt
