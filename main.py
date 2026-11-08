@@ -1,3 +1,4 @@
+import argparse
 import os
 import sys
 import time
@@ -692,7 +693,7 @@ def prune_recent_completions() -> None:
             del recent_completions[key]
 
 
-async def main(base_url, api_key):
+async def main(base_url, api_key, run_once: bool = False):
     worker_threads = []
     for i in range(num_workers):
         t = threading.Thread(target=translation_worker, args=(i, base_url, api_key), daemon=True)
@@ -718,6 +719,11 @@ async def main(base_url, api_key):
                     await scan_and_process_movies(client, base_url, api_key, budget)
             except Exception:
                 logger.exception("Uncaught exception during scan")
+
+            if run_once:
+                # --once: perform a single cycle and shut down gracefully
+                # instead of sleeping until the next scan interval
+                break
 
             try:
                 # Interruptible sleep: a shutdown signal is honored immediately
@@ -745,6 +751,14 @@ def handle_shutdown():
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Automate subtitle translations by scanning Bazarr's wanted list "
+                    "and queueing the translations through its API"
+    )
+    parser.add_argument("--once", action="store_true",
+                        help="run a single scan cycle and exit instead of scanning in a loop")
+    args = parser.parse_args()
+
     # Do verification on arguments
     base_url = os.getenv("BAZARR_BASE_URL")
     api_key = os.getenv("BAZARR_API_KEY")
@@ -871,6 +885,6 @@ if __name__ == "__main__":
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, handle_shutdown)
 
-        loop.run_until_complete(main(base_url, api_key))
+        loop.run_until_complete(main(base_url, api_key, run_once=args.once))
     finally:
         loop.close()

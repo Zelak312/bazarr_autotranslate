@@ -103,6 +103,8 @@ The script is configured via environment variables using a `.env` file in the sa
 2. Run the script by executing `python main.py`.
 3. The script will periodically scan Bazarr via API, detect missing subtitles, and queue translation tasks as needed.
 
+Pass `--once` to run a single scan cycle and exit instead of scanning in a loop, for example to validate a configuration together with `DRY_RUN=true`, or to drive the scans from an external scheduler.
+
 ---
 
 ## How it Works
