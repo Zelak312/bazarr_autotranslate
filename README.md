@@ -118,6 +118,8 @@ The script is configured via environment variables using a `.env` file in the sa
 
 Logs are saved to the directory specified by `LOG_DIRECTORY` with the log level set by `LOG_LEVEL` and the retention set by `LOG_BACKUP_COUNT`. This helps monitor script actions and troubleshoot issues.
 
+The log directory lives inside the container filesystem, so mount it as a volume (see the [Docker Compose example](#docker-compose-example)) if the logs should survive a container recreation.
+
 ---
 
 ## Lingarr
