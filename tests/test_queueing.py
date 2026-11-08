@@ -36,9 +36,11 @@ def test_queueing_enqueues_the_task(monkeypatch):
         assert main.task_queue.check_key(key) is True
     finally:
         main.task_queue.done(task)
-    # done() releases the deduplication key so the task could be queued
-    # again; it does not remove the item from the queue, which is get()'s
-    # job (performed by the worker)
+        # done() only releases the deduplication key so the task could be
+        # queued again; removing the item from the queue is get()'s job,
+        # performed by the worker. Remove the item here as well so that
+        # later tests start from an empty queue.
+        main.task_queue.q.popleft()
     assert main.task_queue.check_key(key) is False
 
 
@@ -49,9 +51,10 @@ def test_recently_completed_translation_is_not_requeued(monkeypatch):
     with main.completion_lock:
         main.recent_completions[key] = time.monotonic()
     try:
+        before = len(main.task_queue.q)
         queued = main.queue_subtitles_for_translation([task])
         assert queued == 0
-        assert len(main.task_queue.q) == 0
+        assert len(main.task_queue.q) == before
     finally:
         with main.completion_lock:
             main.recent_completions.pop(key, None)
@@ -64,9 +67,10 @@ def test_exceeded_retries_skip_the_task(monkeypatch):
     with main.failure_lock:
         main.failure_counts[key] = 3
     try:
+        before = len(main.task_queue.q)
         queued = main.queue_subtitles_for_translation([task])
         assert queued == 0
-        assert len(main.task_queue.q) == 0
+        assert len(main.task_queue.q) == before
     finally:
         with main.failure_lock:
             main.failure_counts.pop(key, None)
