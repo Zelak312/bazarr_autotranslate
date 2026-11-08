@@ -585,10 +585,18 @@ def rate_limit_wait() -> bool:
     return False
 
 
+def build_worker_client() -> httpx.Client:
+    """
+    HTTP client used by a translation worker. A module-level factory so
+    tests can substitute a client with a mock transport.
+    """
+    return httpx.Client(timeout=translation_request_timeout)
+
+
 def translation_worker(worker_id, base_url, api_key):
     endpoint = f"{base_url}/api/subtitles"
     headers = {"X-API-KEY": api_key}
-    with httpx.Client(timeout=translation_request_timeout) as client:
+    with build_worker_client() as client:
         while True:
             sub: SubtitleTranslate | None = task_queue.get()
             if sub is None:
