@@ -28,13 +28,18 @@ def test_queueing_enqueues_the_task(monkeypatch):
     monkeypatch.setattr(main, "dry_run", False)
     monkeypatch.setattr(main, "requeue_cooldown", 0)
     task = _task()
+    key = main.task_key(task.is_serie, task.video_id, task.to_language, task.to_forced, task.to_hi)
     try:
         queued = main.queue_subtitles_for_translation([task])
         assert queued == 1
         assert main.task_queue.q[0] is task
+        assert main.task_queue.check_key(key) is True
     finally:
         main.task_queue.done(task)
-    assert len(main.task_queue.q) == 0
+    # done() releases the deduplication key so the task could be queued
+    # again; it does not remove the item from the queue, which is get()'s
+    # job (performed by the worker)
+    assert main.task_queue.check_key(key) is False
 
 
 def test_recently_completed_translation_is_not_requeued(monkeypatch):
