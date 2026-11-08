@@ -142,3 +142,18 @@ def test_budget_caps_the_number_of_translations(tmp_path, monkeypatch):
 
     assert result is not None
     assert len(result) == 1
+
+
+def test_budget_exhausted_defers_all_matches(tmp_path, monkeypatch):
+    _setup(monkeypatch)
+    source = tmp_path / "episode.en.srt"
+    source.write_text("x", encoding="utf-8")
+
+    # The budget of this cycle is already exhausted, so the match must be
+    # deferred: the scan reports None instead of an empty list
+    budget = main.ScanBudget(1)
+    budget.consume(1)
+    wanted = Serie.from_dict(_episode(10, missing=[_missing("nl")], subtitles=[]))
+    metadata = [_episode(10, missing=[_missing("nl")], subtitles=[_subtitle(str(source))])]
+
+    assert _run_find_base([wanted], metadata, budget=budget) is None

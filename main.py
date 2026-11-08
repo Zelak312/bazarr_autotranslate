@@ -481,6 +481,13 @@ async def find_base_language_subtitles_from_missing_subtitles(
         )
         subtitles_to_translate = subtitles_to_translate[:remaining]
 
+    if len(subtitles_to_translate) == 0:
+        # Only reachable when the per-cycle budget capped the list to zero:
+        # all matches are deferred to the next cycle. None (not []) tells
+        # the caller that this scan has nothing left to queue.
+        logger.info("All matching subtitles deferred to the next scan cycle: the per-cycle budget is exhausted")
+        return None
+
     logger.debug(f"Matching subtitles: {[asdict(w) for w in subtitles_to_translate]}")
     logger.info(f"Found {len(subtitles_to_translate)} matching subtitles to translate")
     return subtitles_to_translate
