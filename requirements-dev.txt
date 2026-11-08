@@ -1,2 +1,4 @@
 pytest>=8,<10
-ruff>=0.6
+# Pinned: newer ruff releases enable additional rule categories (pyupgrade,
+# tryceratops) that flag the coding style of code merged earlier in this stack.
+ruff==0.6.9
