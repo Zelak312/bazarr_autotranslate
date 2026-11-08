@@ -376,6 +376,12 @@ async def find_base_language_subtitles_from_missing_subtitles(
     # the same language can be missing more than once (as regular, forced
     # and hearing-impaired variants), and each variant needs its own
     # translation request with its own flags.
+    # Skip counters for the per-scan INFO summary, so the reason nothing
+    # was queued stays visible without DEBUG logging
+    skipped_already_queued = 0
+    skipped_age_gate = 0
+    skipped_no_source = 0
+
     video_id_missing_map: dict[int, List[MissingSubtitle]] = {}
     for video in videos:
         # Get video id from the correct property depending on the video instance
@@ -386,6 +392,7 @@ async def find_base_language_subtitles_from_missing_subtitles(
                 # Check if that subtitle is already in the translation queue
                 if task_queue.check_key(task_key(isinstance(video, Serie), video_id,
                                                  missing_sub.code2, missing_sub.forced, missing_sub.hi)):
+                    skipped_already_queued += 1
                     logger.debug(f"Skipping subtitle, already in translation queue, {asdict(missing_sub)}")
                     continue
 
@@ -439,13 +446,21 @@ async def find_base_language_subtitles_from_missing_subtitles(
             # that satisfy the minimum age. Only external files qualify, and
             # a subtitle that already has the target language is never used
             # as a source (guards against overlapping base/target lists).
-            candidates = [sub for sub in video.subtitles
-                          if sub.code2 in base_languages
-                          and sub.code2 != missing.code2
-                          and sub.path
-                          and is_subtitle_old_enough(sub.path, age_cache)]
+            source_too_fresh = False
+            candidates = []
+            for sub in video.subtitles:
+                if sub.code2 not in base_languages or sub.code2 == missing.code2 or not sub.path:
+                    continue
+                if not is_subtitle_old_enough(sub.path, age_cache):
+                    source_too_fresh = True
+                    continue
+                candidates.append(sub)
 
             if not candidates:
+                if source_too_fresh:
+                    skipped_age_gate += 1
+                else:
+                    skipped_no_source += 1
                 logger.debug(f"No matching existing subtitle found for: {missing.code2} "
                              f"(forced: {missing.forced}, hi: {missing.hi}) for video: {video_id}")
                 continue
@@ -467,7 +482,10 @@ async def find_base_language_subtitles_from_missing_subtitles(
                                                             missing.hi, video_id, isinstance(video, Serie)))
 
     if len(subtitles_to_translate) == 0:
-        logger.info("No already existing subtitles matched with requested translation subs")
+        logger.info("No already existing subtitles matched with requested translation subs "
+                    f"(skipped: {skipped_already_queued} already in the queue, "
+                    f"{skipped_age_gate} with sources below the minimum age, "
+                    f"{skipped_no_source} without a usable source)")
         return None
 
     # The cap applies per scan cycle, to protect a (paid) translation
@@ -489,12 +507,17 @@ async def find_base_language_subtitles_from_missing_subtitles(
         return None
 
     logger.debug(f"Matching subtitles: {[asdict(w) for w in subtitles_to_translate]}")
-    logger.info(f"Found {len(subtitles_to_translate)} matching subtitles to translate")
+    logger.info(f"Found {len(subtitles_to_translate)} matching subtitles to translate "
+                f"(skipped: {skipped_already_queued} already in the queue, "
+                f"{skipped_age_gate} with sources below the minimum age, "
+                f"{skipped_no_source} without a usable source)")
     return subtitles_to_translate
 
 
 def queue_subtitles_for_translation(subtitles: List[SubtitleTranslate]) -> int:
     queued = 0
+    skipped_retries = 0
+    skipped_cooldown = 0
     for sub in subtitles:
         key = task_key(sub.is_serie, sub.video_id, sub.to_language, sub.to_forced, sub.to_hi)
         # Skip items that have exceeded the retry limit, so a permanently
@@ -508,6 +531,7 @@ def queue_subtitles_for_translation(subtitles: List[SubtitleTranslate]) -> int:
                 f"it already failed {failures} times (MAX_RETRIES={max_retries}). "
                 f"Restart the process to retry it again."
             )
+            skipped_retries += 1
             continue
         # Suppress re-queueing a translation for a short time after it
         # completed: Bazarr has not re-indexed the newly written subtitle
@@ -519,6 +543,7 @@ def queue_subtitles_for_translation(subtitles: List[SubtitleTranslate]) -> int:
                 logger.debug(f"Skipping {sub.base_subtitle.path} to {sub.to_language}, "
                              f"it was translated less than {requeue_cooldown} seconds ago and Bazarr may not "
                              f"have re-indexed the new subtitle yet")
+                skipped_cooldown += 1
                 continue
         variant = f"{'.forced' if sub.to_forced else ''}{'.hi' if sub.to_hi else ''}"
         if dry_run:
@@ -530,6 +555,10 @@ def queue_subtitles_for_translation(subtitles: List[SubtitleTranslate]) -> int:
         task_queue.put(sub)
         queued += 1
         logger.info(f"Queued: {sub.base_subtitle.path} to be translated to: {sub.to_language}{variant}")
+    if skipped_retries:
+        logger.info(f"Skipped {skipped_retries} translations that exceeded the retry limit")
+    if skipped_cooldown:
+        logger.info(f"Skipped {skipped_cooldown} translations that completed within the re-queue cooldown")
     return queued
 
 
