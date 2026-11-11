@@ -57,3 +57,9 @@ def test_scan_budget_remaining_and_consume():
 
     disabled = main.ScanBudget(0)
     assert disabled.remaining() is None
+
+
+def test_normalize_base_url_strips_trailing_slashes():
+    assert main.normalize_base_url("http://bazarr:6767") == "http://bazarr:6767"
+    assert main.normalize_base_url("http://bazarr:6767/") == "http://bazarr:6767"
+    assert main.normalize_base_url("http://bazarr:6767///") == "http://bazarr:6767"

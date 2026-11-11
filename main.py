@@ -1,3 +1,4 @@
+import argparse
 import os
 import sys
 import time
@@ -49,6 +50,15 @@ def parse_int(env_name: str, default: int) -> int:
     except ValueError:
         print(f"Invalid integer value for {env_name}: {val!r}")
         sys.exit(1)
+
+
+def normalize_base_url(url: str) -> str:
+    """
+    Strip trailing slashes from the base URL: a value like
+    "http://host:6767/" would otherwise produce "//api/..." in every
+    endpoint URL, which Bazarr rejects.
+    """
+    return url.rstrip("/")
 
 
 def task_key(is_serie: bool, video_id: int, to_language: str, to_forced: bool, to_hi: bool) -> str:
@@ -150,6 +160,10 @@ failure_lock = threading.Lock()
 # time.monotonic() so the entries stay valid across wall-clock changes.
 recent_completions: dict[str, float] = {}
 completion_lock = threading.Lock()
+# Start time of the most recent translation request sent to Bazarr, used
+# to enforce TRANSLATION_DELAY_SECONDS globally across all worker threads.
+last_request_time = 0.0
+rate_limit_lock = threading.Lock()
 logger = logging.getLogger("bazarr_lingarr")
 
 
@@ -363,6 +377,12 @@ async def find_base_language_subtitles_from_missing_subtitles(
     # the same language can be missing more than once (as regular, forced
     # and hearing-impaired variants), and each variant needs its own
     # translation request with its own flags.
+    # Skip counters for the per-scan INFO summary, so the reason nothing
+    # was queued stays visible without DEBUG logging
+    skipped_already_queued = 0
+    skipped_age_gate = 0
+    skipped_no_source = 0
+
     video_id_missing_map: dict[int, List[MissingSubtitle]] = {}
     for video in videos:
         # Get video id from the correct property depending on the video instance
@@ -373,6 +393,7 @@ async def find_base_language_subtitles_from_missing_subtitles(
                 # Check if that subtitle is already in the translation queue
                 if task_queue.check_key(task_key(isinstance(video, Serie), video_id,
                                                  missing_sub.code2, missing_sub.forced, missing_sub.hi)):
+                    skipped_already_queued += 1
                     logger.debug(f"Skipping subtitle, already in translation queue, {asdict(missing_sub)}")
                     continue
 
@@ -426,13 +447,21 @@ async def find_base_language_subtitles_from_missing_subtitles(
             # that satisfy the minimum age. Only external files qualify, and
             # a subtitle that already has the target language is never used
             # as a source (guards against overlapping base/target lists).
-            candidates = [sub for sub in video.subtitles
-                          if sub.code2 in base_languages
-                          and sub.code2 != missing.code2
-                          and sub.path
-                          and is_subtitle_old_enough(sub.path, age_cache)]
+            source_too_fresh = False
+            candidates = []
+            for sub in video.subtitles:
+                if sub.code2 not in base_languages or sub.code2 == missing.code2 or not sub.path:
+                    continue
+                if not is_subtitle_old_enough(sub.path, age_cache):
+                    source_too_fresh = True
+                    continue
+                candidates.append(sub)
 
             if not candidates:
+                if source_too_fresh:
+                    skipped_age_gate += 1
+                else:
+                    skipped_no_source += 1
                 logger.debug(f"No matching existing subtitle found for: {missing.code2} "
                              f"(forced: {missing.forced}, hi: {missing.hi}) for video: {video_id}")
                 continue
@@ -454,7 +483,10 @@ async def find_base_language_subtitles_from_missing_subtitles(
                                                             missing.hi, video_id, isinstance(video, Serie)))
 
     if len(subtitles_to_translate) == 0:
-        logger.info("No already existing subtitles matched with requested translation subs")
+        logger.info("No already existing subtitles matched with requested translation subs "
+                    f"(skipped: {skipped_already_queued} already in the queue, "
+                    f"{skipped_age_gate} with sources below the minimum age, "
+                    f"{skipped_no_source} without a usable source)")
         return None
 
     # The cap applies per scan cycle, to protect a (paid) translation
@@ -468,13 +500,25 @@ async def find_base_language_subtitles_from_missing_subtitles(
         )
         subtitles_to_translate = subtitles_to_translate[:remaining]
 
+    if len(subtitles_to_translate) == 0:
+        # Only reachable when the per-cycle budget capped the list to zero:
+        # all matches are deferred to the next cycle. None (not []) tells
+        # the caller that this scan has nothing left to queue.
+        logger.info("All matching subtitles deferred to the next scan cycle: the per-cycle budget is exhausted")
+        return None
+
     logger.debug(f"Matching subtitles: {[asdict(w) for w in subtitles_to_translate]}")
-    logger.info(f"Found {len(subtitles_to_translate)} matching subtitles to translate")
+    logger.info(f"Found {len(subtitles_to_translate)} matching subtitles to translate "
+                f"(skipped: {skipped_already_queued} already in the queue, "
+                f"{skipped_age_gate} with sources below the minimum age, "
+                f"{skipped_no_source} without a usable source)")
     return subtitles_to_translate
 
 
 def queue_subtitles_for_translation(subtitles: List[SubtitleTranslate]) -> int:
     queued = 0
+    skipped_retries = 0
+    skipped_cooldown = 0
     for sub in subtitles:
         key = task_key(sub.is_serie, sub.video_id, sub.to_language, sub.to_forced, sub.to_hi)
         # Skip items that have exceeded the retry limit, so a permanently
@@ -488,6 +532,7 @@ def queue_subtitles_for_translation(subtitles: List[SubtitleTranslate]) -> int:
                 f"it already failed {failures} times (MAX_RETRIES={max_retries}). "
                 f"Restart the process to retry it again."
             )
+            skipped_retries += 1
             continue
         # Suppress re-queueing a translation for a short time after it
         # completed: Bazarr has not re-indexed the newly written subtitle
@@ -499,6 +544,7 @@ def queue_subtitles_for_translation(subtitles: List[SubtitleTranslate]) -> int:
                 logger.debug(f"Skipping {sub.base_subtitle.path} to {sub.to_language}, "
                              f"it was translated less than {requeue_cooldown} seconds ago and Bazarr may not "
                              f"have re-indexed the new subtitle yet")
+                skipped_cooldown += 1
                 continue
         variant = f"{'.forced' if sub.to_forced else ''}{'.hi' if sub.to_hi else ''}"
         if dry_run:
@@ -510,13 +556,47 @@ def queue_subtitles_for_translation(subtitles: List[SubtitleTranslate]) -> int:
         task_queue.put(sub)
         queued += 1
         logger.info(f"Queued: {sub.base_subtitle.path} to be translated to: {sub.to_language}{variant}")
+    if skipped_retries:
+        logger.info(f"Skipped {skipped_retries} translations that exceeded the retry limit")
+    if skipped_cooldown:
+        logger.info(f"Skipped {skipped_cooldown} translations that completed within the re-queue cooldown")
     return queued
+
+
+def rate_limit_wait() -> bool:
+    """
+    Enforce TRANSLATION_DELAY_SECONDS globally: before a worker sends a
+    translation request, wait until the configured delay has passed since
+    the previous request of ANY worker, so the requests of multiple
+    workers are spaced as well. Returns True when a shutdown was
+    requested during the wait, in which case the caller must not send.
+    Waiting on the shutdown thread event keeps a shutdown signal
+    effective during the delay.
+    """
+    global last_request_time
+    if translation_delay <= 0:
+        return False
+    with rate_limit_lock:
+        wait_for = translation_delay - (time.monotonic() - last_request_time)
+        if wait_for > 0:
+            if shutdown_thread_event.wait(wait_for):
+                return True
+        last_request_time = time.monotonic()
+    return False
+
+
+def build_worker_client() -> httpx.Client:
+    """
+    HTTP client used by a translation worker. A module-level factory so
+    tests can substitute a client with a mock transport.
+    """
+    return httpx.Client(timeout=translation_request_timeout)
 
 
 def translation_worker(worker_id, base_url, api_key):
     endpoint = f"{base_url}/api/subtitles"
     headers = {"X-API-KEY": api_key}
-    with httpx.Client(timeout=translation_request_timeout) as client:
+    with build_worker_client() as client:
         while True:
             sub: SubtitleTranslate | None = task_queue.get()
             if sub is None:
@@ -525,6 +605,12 @@ def translation_worker(worker_id, base_url, api_key):
                 return
             key = task_key(sub.is_serie, sub.video_id, sub.to_language, sub.to_forced, sub.to_hi)
             logger.info(f"[Worker: {worker_id}] Translating: {sub.base_subtitle.path} to: {sub.to_language}")
+            if rate_limit_wait():
+                # A shutdown was requested during the rate-limit wait:
+                # release the task without sending it, so a future run
+                # queues it again
+                task_queue.done(sub)
+                continue
             try:
                 params = {
                     "action": "translate",
@@ -559,11 +645,6 @@ def translation_worker(worker_id, base_url, api_key):
                     failure_counts[key] = failure_counts.get(key, 0) + 1
             finally:
                 task_queue.done(sub)
-                if translation_delay > 0:
-                    # Rate limiting: space out requests to the translation
-                    # service. Waiting on the shutdown event lets a shutdown
-                    # signal interrupt the delay immediately.
-                    shutdown_thread_event.wait(translation_delay)
 
 
 async def _scan_wanted(client, base_url, api_key, label, wanted_fetch, budget: Optional[ScanBudget] = None):
@@ -620,7 +701,7 @@ def prune_recent_completions() -> None:
             del recent_completions[key]
 
 
-async def main(base_url, api_key):
+async def main(base_url, api_key, run_once: bool = False):
     worker_threads = []
     for i in range(num_workers):
         t = threading.Thread(target=translation_worker, args=(i, base_url, api_key), daemon=True)
@@ -646,6 +727,11 @@ async def main(base_url, api_key):
                     await scan_and_process_movies(client, base_url, api_key, budget)
             except Exception:
                 logger.exception("Uncaught exception during scan")
+
+            if run_once:
+                # --once: perform a single cycle and shut down gracefully
+                # instead of sleeping until the next scan interval
+                break
 
             try:
                 # Interruptible sleep: a shutdown signal is honored immediately
@@ -673,6 +759,14 @@ def handle_shutdown():
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Automate subtitle translations by scanning Bazarr's wanted list "
+                    "and queueing the translations through its API"
+    )
+    parser.add_argument("--once", action="store_true",
+                        help="run a single scan cycle and exit instead of scanning in a loop")
+    args = parser.parse_args()
+
     # Do verification on arguments
     base_url = os.getenv("BAZARR_BASE_URL")
     api_key = os.getenv("BAZARR_API_KEY")
@@ -684,6 +778,10 @@ if __name__ == "__main__":
     if api_key is None:
         print("BAZARR_API_KEY is missing")
         sys.exit(1)
+
+    # Normalize early: a trailing slash would otherwise produce "//api/..."
+    # in every endpoint URL built from this value
+    base_url = normalize_base_url(base_url)
 
     if len(base_languages) == 0:
         print("Missing BASE_LANGUAGES")
@@ -784,8 +882,10 @@ if __name__ == "__main__":
         case "error":
             logger.setLevel(logging.ERROR)
         case _:
-            print(f"Unknown LOG_LEVEL: {log_level!r}, falling back to INFO")
-            logger.setLevel(logging.INFO)
+            # Fail fast on a typo in LOG_LEVEL: silently falling back to
+            # INFO would hide a requested DEBUG (or ERROR) configuration
+            print(f"Unknown LOG_LEVEL: {log_level!r}, expected DEBUG, INFO, WARNING or ERROR")
+            sys.exit(1)
 
     # Start running things
     loop = asyncio.new_event_loop()
@@ -793,6 +893,6 @@ if __name__ == "__main__":
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, handle_shutdown)
 
-        loop.run_until_complete(main(base_url, api_key))
+        loop.run_until_complete(main(base_url, api_key, run_once=args.once))
     finally:
         loop.close()
