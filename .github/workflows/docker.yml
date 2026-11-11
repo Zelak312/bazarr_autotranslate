@@ -18,28 +18,31 @@ jobs:
             PLATFORMS: linux/amd64, linux/arm64
         steps:
             - name: Checkout
-              uses: actions/checkout@v4
+              uses: actions/checkout@v7
+              with:
+                  # The latest-tag detection compares the dispatched tag
+                  # against the full tag list, which needs the tags on
+                  # disk: the default shallow checkout fetches a single
+                  # commit and no tags at all
+                  fetch-depth: 0
 
             - name: Set up QEMU
-              uses: docker/setup-qemu-action@v3
+              uses: docker/setup-qemu-action@v4
 
             - name: Set up Docker Buildx
-              uses: docker/setup-buildx-action@v3
+              uses: docker/setup-buildx-action@v4
 
             - name: Login to GitHub Container Registry
-              uses: docker/login-action@v3
+              uses: docker/login-action@v4
               with:
                   registry: ghcr.io
                   username: ${{ github.repository_owner  }}
                   password: ${{ secrets.GITHUB_TOKEN }}
 
             - name: Determine Tag Name
-              run: |
-                  if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-                    echo "tag=${{ github.event.inputs.tag }}" >> $GITHUB_ENV
-                  else
-                    echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
-                  fi
+              # Only workflow_dispatch can trigger this workflow, so the tag
+              # always comes from the dispatch input
+              run: echo "tag=${{ github.event.inputs.tag }}" >> $GITHUB_ENV
 
             - name: Determine if latest tag
               run: |
@@ -58,7 +61,7 @@ jobs:
 
             - name: Build and push image with latest tag
               if: env.is_latest == 'true'
-              uses: docker/build-push-action@v5
+              uses: docker/build-push-action@v7
               with:
                   context: .
                   file: ./Dockerfile
@@ -70,7 +73,7 @@ jobs:
 
             - name: Build and push image without latest tag
               if: env.is_latest != 'true'
-              uses: docker/build-push-action@v5
+              uses: docker/build-push-action@v7
               with:
                   context: .
                   file: ./Dockerfile
